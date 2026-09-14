@@ -1,0 +1,35 @@
+Build qemu:
+
+
+git clone https://github.com/qemu/qemu.git
+cd qemu
+git submodule update --init --recursive
+
+
+mkdir build && cd build
+../configure --target-list=x86_64-softmmu
+ninja
+
+
+
+Build buildroot:
+
+make qemu_x86_64_defconfig
+make -j$(nproc)
+
+(deselect host qemu in  make menuconfig)
+
+
+
+
+start qemu:
+
+/build/qemu-system-x86_64 \
+  -M q35 \
+  -m 512M \
+  -enable-kvm \
+  -device mynet-pci \
+  -kernel buildroot/output/images/bzImage \
+  -drive file=buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
+  -append "root=/dev/vda console=ttyS0" \
+  -nographic
