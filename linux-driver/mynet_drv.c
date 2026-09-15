@@ -86,8 +86,32 @@ static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     dev_info(&pdev->dev, "mynet: scratch wrote 0xdeadbeef, read back 0x%08x\n",
               scratch);
 
+    /* Allocate one MSI-X vector. PCI_IRQ_MSIX only (no fallback to
+     * MSI/INTx) since the device only implements MSI-X. */
+    err = pci_msix_vec_count(pdev);
+    dev_info(&pdev->dev, "mynet: pci_msix_vec_count() = %d\n", err);
+    err = pci_alloc_irq_vectors(pdev, MYNET_NUM_VECTORS, MYNET_NUM_VECTORS,
+                                 PCI_IRQ_MSIX);
+    if (err < 0) {
+        dev_err(&pdev->dev, "mynet: pci_alloc_irq_vectors failed: %d\n", err);
+        goto err_unmap;
+    }
+
+    priv->irq = pci_irq_vector(pdev, 0);
+    err = request_irq(priv->irq, mynet_irq_handler, 0, "mynet", priv);
+    if (err) {
+        dev_err(&pdev->dev, "mynet: request_irq failed: %d\n", err);
+        goto err_free_vectors;
+    }
+    dev_info(&pdev->dev, "mynet: MSI-X vector 0 -> irq %d\n", priv->irq);
+
+    /* Self-test: ring the doorbell once and confirm the handler fires. */
+    iowrite32(1, priv->bar0 + MYNET_REG_IRQ_TRIGGER);
+
     return 0;
 
+err_free_vectors:
+    pci_free_irq_vectors(pdev);
 err_unmap:
     pci_iounmap(pdev, priv->bar0);
 err_release:
@@ -101,8 +125,11 @@ static void mynet_remove(struct pci_dev *pdev)
 {
     struct mynet_priv *priv = pci_get_drvdata(pdev);
 
-    dev_info(&pdev->dev, "mynet: removing device\n");
+    dev_info(&pdev->dev, "mynet: removing device (total irqs: %u)\n",
+              priv->irq_count);
 
+    free_irq(priv->irq, priv);
+    pci_free_irq_vectors(pdev);
     pci_iounmap(pdev, priv->bar0);
     pci_release_region(pdev, 0);
     pci_disable_device(pdev);

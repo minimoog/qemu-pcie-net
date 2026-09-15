@@ -71,4 +71,25 @@ mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host
 insmod /mnt/host/mynet_drv.ko
 
 
+buildroot needs msi-x enabled:
 
+Symbol: PCI_MSI [=y]                                                                                                                                   │  
+  │ Type  : bool                                                                                                                                           │  
+  │ Defined at drivers/pci/Kconfig:45                                                                                                                      │  
+  │   Prompt: Message Signaled Interrupts (MSI and MSI-X)                                                                                                  │  
+  │   Depends on: PCI [=y]                                                                                                                                 │  
+  │   Location:                                                                                                                                            │  
+  │     -> Device Drivers                                                                                                                                  │  
+  │       -> PCI support (PCI [=y])                                                                                                                        │  
+  │ (1)     -> Message Signaled Interrupts (MSI and MSI-X) (PCI_MSI [=y])                                                                                  │  
+  │ Selects: GENERIC_MSI_IRQ [=y]                                                                                                                          │  
+  │ Selected by [n]:                                                                                                                                       │  
+  │   - AMD_IOMMU [=n] && IOMMU_SUPPORT [=y] && X86_64 [=y] && PCI [=y] && ACPI [=y] && HAVE_CMPXCHG_DOUBLE [=y]                                           │  
+  │   - ARM_GIC_V2M [=n] && PCI [=y]                                                                                                                       │  
+  │   - ARMADA_370_XP_IRQ [=n] && PCI [=y]                                                                                                                 │  
+  │   - ALPINE_MSI [=n] && PCI [=y]                                                                                                                        │  
+  │   - LOONGSON_PCH_MSI [=n] && MACH_LOONGSON64 && PCI [=y]                                                                                               │  
+  │   - SOPHGO_SG2042_MSI [=n] && (ARCH_SOPHGO || COMPILE_TEST [=n]) && PCI [=y]    
+
+
+  
