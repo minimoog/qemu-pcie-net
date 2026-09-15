@@ -3,13 +3,15 @@
  *
  * Goal of this step: a device that enumerates in the guest (visible in
  * `lspci`), exposes one MMIO BAR (BAR0), and lets a guest driver read/write
- * a couple of registers. No DMA, no interrupts, no networking yet 
+ * a couple of registers. No DMA, no interrupts, no networking yet -
+ * those come in later steps.
  *
  * Drop this file into: hw/net/mynet.c  (inside the QEMU source tree)
  * Build wiring shown at the bottom of this file's comments.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "qom/object.h"
@@ -17,7 +19,10 @@
 #define TYPE_MYNET_PCI "mynet-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(MyNetState, MYNET_PCI)
 
-
+/* Pick IDs from QEMU's own vendor ID so we don't collide with real
+ * hardware. 0x1234 is QEMU's "for emulated/virtual devices" vendor ID
+ * (same one used by the qemu vga/bochs display device). Device ID is
+ * yours to choose as long as it's not already used elsewhere in QEMU. */
 #define MYNET_VENDOR_ID   0x1234
 #define MYNET_DEVICE_ID   0xBEEF
 
@@ -101,7 +106,7 @@ static void mynet_exit(PCIDevice *pdev)
     /* Nothing to free yet - no interrupts, no allocated buffers. */
 }
 
-static void mynet_class_init(ObjectClass *klass, void *data)
+static void mynet_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
