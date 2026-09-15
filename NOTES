@@ -64,3 +64,11 @@ Symbol: NET_9P_VIRTIO [=n]
   Depends on: NET_9P [=n] && VIRTIO
 
 
+Mount shared directory in qemu and insmod the driver:
+
+mkdir -p /mnt/host
+mount -t 9p -o trans=virtio,version=9p2000.L hostshare /mnt/host
+insmod /mnt/host/mynet_drv.ko
+
+
+
