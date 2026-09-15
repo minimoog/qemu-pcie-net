@@ -1,9 +1,10 @@
 /*
- * mynet.c - Minimal QEMU PCI device skeleton
+ * mynet.c - QEMU PCI device model for the "mynet-pci" learning project
  *
- * Goal of this step: a device that enumerates in the guest (visible in
- * `lspci`), exposes one MMIO BAR (BAR0), and lets a guest driver read/write
- * a couple of registers. No DMA, no interrupts, no networking yet
+ * Implements so far: PCI/PCIe enumeration, one MMIO register BAR (BAR0),
+ * an MSI-X interrupt (BAR1, one vector), and a synchronous loopback DMA
+ * test (guest RAM -> device bounce buffer -> guest RAM, no descriptor
+ * rings yet).
  *
  * Drop this file into: hw/net/mynet.c  (inside the QEMU source tree)
  * Build wiring shown at the bottom of this file's comments.
@@ -14,6 +15,7 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "system/dma.h"
 #include "qom/object.h"
 
 #define TYPE_MYNET_PCI "mynet-pci"
@@ -33,6 +35,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(MyNetState, MYNET_PCI)
                                      * a synthetic "doorbell" purely for
                                      * testing the interrupt path before we
                                      * have real TX/RX completions to signal. */
+
+/* --- Loopback DMA test registers ---
+ * Guest fills a source buffer in its own RAM, tells us the physical
+ * (bus) addresses of that source buffer and of a separate destination
+ * buffer, plus a length, then writes DMA_START. We DMA-read the source,
+ * DMA-write it straight to the destination, set a status register, and
+ * fire the same MSI-X vector as the doorbell test above. This proves
+ * the device can move data via DMA into/out of guest RAM without any
+ * ring/descriptor bookkeeping yet - that's the next step. */
+#define MYNET_REG_DMA_SRC_LO   0x10
+#define MYNET_REG_DMA_SRC_HI   0x14
+#define MYNET_REG_DMA_DST_LO   0x18
+#define MYNET_REG_DMA_DST_HI   0x1C
+#define MYNET_REG_DMA_LEN      0x20
+#define MYNET_REG_DMA_START    0x24 /* WO: any write triggers the copy */
+#define MYNET_REG_DMA_STATUS   0x28 /* RO: 0=idle/ok, 1=error */
+
+#define MYNET_DMA_STATUS_OK    0
+#define MYNET_DMA_STATUS_ERROR 1
+#define MYNET_MAX_DMA_LEN      4096 /* keep the bounce buffer small & fixed */
+
 #define MYNET_BAR0_SIZE    0x1000 /* 4KB is plenty for a handful of registers */
 
 /* BAR1 is dedicated to the MSI-X table + PBA (see msix_init_exclusive_bar).
@@ -47,7 +70,62 @@ struct MyNetState {
 
     MemoryRegion mmio;
     uint32_t scratch;
+
+    uint32_t dma_src_lo, dma_src_hi;
+    uint32_t dma_dst_lo, dma_dst_hi;
+    uint32_t dma_len;
+    uint32_t dma_status;
 };
+
+/* --- Loopback DMA implementation --- */
+
+static void mynet_do_loopback_dma(MyNetState *s)
+{
+    dma_addr_t src = ((dma_addr_t)s->dma_src_hi << 32) | s->dma_src_lo;
+    dma_addr_t dst = ((dma_addr_t)s->dma_dst_hi << 32) | s->dma_dst_lo;
+    uint32_t len = s->dma_len;
+    uint8_t buf[MYNET_MAX_DMA_LEN];
+    MemTxResult res;
+
+    if (len == 0 || len > MYNET_MAX_DMA_LEN) {
+        qemu_log_mask(LOG_GUEST_ERROR, "mynet: bad DMA len %u\n", len);
+        s->dma_status = MYNET_DMA_STATUS_ERROR;
+        goto notify;
+    }
+
+    /* Bus-master check: real hardware ignores DMA requests if the guest
+     * hasn't set the Bus Master Enable bit in the PCI command register
+     * (pci_set_master() on the driver side). We mirror that here. */
+    if (!(s->parent_obj.config[PCI_COMMAND] & PCI_COMMAND_MASTER)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mynet: DMA requested but bus mastering not enabled\n");
+        s->dma_status = MYNET_DMA_STATUS_ERROR;
+        goto notify;
+    }
+
+    res = pci_dma_read(&s->parent_obj, src, buf, len);
+    if (res != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mynet: DMA read failed at 0x%" PRIx64 "\n", src);
+        s->dma_status = MYNET_DMA_STATUS_ERROR;
+        goto notify;
+    }
+
+    res = pci_dma_write(&s->parent_obj, dst, buf, len);
+    if (res != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mynet: DMA write failed at 0x%" PRIx64 "\n", dst);
+        s->dma_status = MYNET_DMA_STATUS_ERROR;
+        goto notify;
+    }
+
+    s->dma_status = MYNET_DMA_STATUS_OK;
+
+notify:
+    if (msix_enabled(&s->parent_obj)) {
+        msix_notify(&s->parent_obj, 0);
+    }
+}
 
 /* --- MMIO read/write callbacks for BAR0 --- */
 
@@ -60,6 +138,8 @@ static uint64_t mynet_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return MYNET_MAGIC;
     case MYNET_REG_SCRATCH:
         return s->scratch;
+    case MYNET_REG_DMA_STATUS:
+        return s->dma_status;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "mynet: unhandled read at 0x%" HWADDR_PRIx "\n", addr);
@@ -86,6 +166,24 @@ static void mynet_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             qemu_log_mask(LOG_GUEST_ERROR,
                           "mynet: IRQ_TRIGGER written but MSI-X not enabled\n");
         }
+        break;
+    case MYNET_REG_DMA_SRC_LO:
+        s->dma_src_lo = (uint32_t)val;
+        break;
+    case MYNET_REG_DMA_SRC_HI:
+        s->dma_src_hi = (uint32_t)val;
+        break;
+    case MYNET_REG_DMA_DST_LO:
+        s->dma_dst_lo = (uint32_t)val;
+        break;
+    case MYNET_REG_DMA_DST_HI:
+        s->dma_dst_hi = (uint32_t)val;
+        break;
+    case MYNET_REG_DMA_LEN:
+        s->dma_len = (uint32_t)val;
+        break;
+    case MYNET_REG_DMA_START:
+        mynet_do_loopback_dma(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -132,6 +230,7 @@ static void mynet_realize(PCIDevice *pdev, Error **errp)
     msix_vector_use(pdev, 0);
 
     s->scratch = 0;
+    s->dma_status = MYNET_DMA_STATUS_OK;
 }
 
 static void mynet_exit(PCIDevice *pdev)
@@ -172,3 +271,28 @@ static void mynet_register_types(void)
 }
 
 type_init(mynet_register_types)
+
+/*
+ *  Run with the device attached:
+ *      qemu-system-x86_64 ... -device mynet-pci
+ *
+ * In the guest, confirm it enumerates:
+ *      lspci -v | grep -A5 1234:beef
+ *    You should now see BAR0 (4KB MMIO regs) AND BAR1 (MSI-X table/PBA),
+ *    plus an "MSI-X: Enable+" capability line once the guest driver turns
+ *    it on.
+ *
+ * Test the interrupt path from the guest:
+ *   - insmod the driver (it enables MSI-X + requests the IRQ in probe)
+ *   - the driver's probe function writes MYNET_REG_IRQ_TRIGGER once as a
+ *     self-test; check dmesg for the IRQ handler firing.
+ *
+ * Test the loopback DMA path from the guest:
+ *   - driver allocates two DMA-coherent buffers (src, dst), fills src
+ *     with a known pattern
+ *   - writes DMA_SRC_LO/HI, DMA_DST_LO/HI, DMA_LEN, then DMA_START
+ *   - device DMA-reads src, DMA-writes dst, sets DMA_STATUS, fires IRQ
+ *   - driver's IRQ handler completes a wait_for_completion; probe then
+ *     memcmp's src vs dst and logs pass/fail
+ * ---------------------------------------------------------------------
+ */
