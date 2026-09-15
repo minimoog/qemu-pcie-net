@@ -3,11 +3,10 @@
  *
  * Goal of this step: bind to the device, map BAR0, prove MMIO read/write
  * works via the magic ID and scratch registers, allocate an MSI-X vector
- * and confirm the interrupt path via a self-test doorbell write, then run
- * a loopback DMA self-test: allocate two coherent buffers, fill one with
- * a known pattern, hand the device both physical addresses + a length,
- * kick it, wait for the completion IRQ, and verify the bytes landed in
- * the destination buffer untouched.
+ * and confirm the interrupt path via a self-test doorbell write, run a
+ * single-buffer loopback DMA self-test, and now a full TX/RX descriptor
+ * ring self-test: post RX buffers, transmit one packet, and confirm it
+ * comes back via the RX ring with matching contents.
  *
  * Build as an out-of-tree module (Makefile below) against the exact
  * kernel you're booting in the guest.
@@ -39,6 +38,35 @@
 #define MYNET_DMA_STATUS_OK    0
 #define MYNET_DMA_STATUS_ERROR 1
 
+#define MYNET_REG_TX_RING_LO   0x30
+#define MYNET_REG_TX_RING_HI   0x34
+#define MYNET_REG_TX_RING_LEN  0x38
+#define MYNET_REG_TX_TAIL      0x3C
+#define MYNET_REG_RX_RING_LO   0x40
+#define MYNET_REG_RX_RING_HI   0x44
+#define MYNET_REG_RX_RING_LEN  0x48
+#define MYNET_REG_RX_TAIL      0x4C
+
+#define MYNET_DESC_F_DD        (1u << 0)
+
+/* Must exactly match the device's MyNetDesc layout: 8+4+4 = 16 bytes,
+ * naturally aligned already so no padding surprises on either side. */
+struct mynet_desc {
+    u64 addr;
+    u32 len;
+    u32 flags;
+};
+
+/* Ring size and the "reserve one slot" rule: we only ever post
+ * MYNET_RING_SIZE - 1 descriptors as available at a time, even though
+ * the ring itself has MYNET_RING_SIZE slots. This avoids the classic
+ * head==tail ambiguity between "ring empty" and "ring completely full"
+ * in a circular buffer - see the matching comment in mynet.c. */
+#define MYNET_RING_SIZE     8
+#define MYNET_RING_USABLE   (MYNET_RING_SIZE - 1)
+#define MYNET_BUF_SIZE      256
+#define MYNET_TEST_PKT_LEN  64
+
 #define MYNET_MAGIC        0xCAFEF00DUL
 #define MYNET_NUM_VECTORS  1
 #define MYNET_DMA_TEST_LEN 256
@@ -56,7 +84,6 @@ static irqreturn_t mynet_irq_handler(int irq, void *data)
     struct mynet_priv *priv = data;
 
     priv->irq_count++;
-    
     dev_info(&priv->pdev->dev, "mynet: IRQ fired (count=%u)\n",
               priv->irq_count);
     complete(&priv->irq_event);
@@ -131,6 +158,117 @@ static void mynet_dma_loopback_test(struct pci_dev *pdev, struct mynet_priv *pri
 out_free:
     dma_free_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, src, src_dma);
     dma_free_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, dst, dst_dma);
+}
+
+/* Run once at probe time: set up a full TX ring and RX ring, pre-post
+ * RX buffers, transmit one test packet, and confirm it comes back via
+ * the RX ring with matching contents (the device loops TX -> RX
+ * internally until we wire up a real -netdev backend). */
+static void mynet_ring_test(struct pci_dev *pdev, struct mynet_priv *priv)
+{
+    struct mynet_desc *tx_ring, *rx_ring;
+    dma_addr_t tx_ring_dma, rx_ring_dma;
+    void *tx_bufs, *rx_bufs;
+    dma_addr_t tx_bufs_dma, rx_bufs_dma;
+    unsigned long timeout;
+    int i;
+
+    tx_ring = dma_alloc_coherent(&pdev->dev,
+                                  MYNET_RING_SIZE * sizeof(*tx_ring),
+                                  &tx_ring_dma, GFP_KERNEL);
+    rx_ring = dma_alloc_coherent(&pdev->dev,
+                                  MYNET_RING_SIZE * sizeof(*rx_ring),
+                                  &rx_ring_dma, GFP_KERNEL);
+    tx_bufs = dma_alloc_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
+                                  &tx_bufs_dma, GFP_KERNEL);
+    rx_bufs = dma_alloc_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
+                                  &rx_bufs_dma, GFP_KERNEL);
+    if (!tx_ring || !rx_ring || !tx_bufs || !rx_bufs) {
+        dev_err(&pdev->dev, "mynet: ring test allocation failed\n");
+        goto out_free;
+    }
+
+    /* Pre-post MYNET_RING_USABLE RX descriptors, each pointing at its
+     * own slice of rx_bufs, offering MYNET_BUF_SIZE bytes of capacity. */
+    for (i = 0; i < MYNET_RING_USABLE; i++) {
+        rx_ring[i].addr = rx_bufs_dma + (i * MYNET_BUF_SIZE);
+        rx_ring[i].len = MYNET_BUF_SIZE;
+        rx_ring[i].flags = 0;
+    }
+
+    iowrite32(lower_32_bits(rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_LO);
+    iowrite32(upper_32_bits(rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_HI);
+    iowrite32(MYNET_RING_SIZE, priv->bar0 + MYNET_REG_RX_RING_LEN);
+    iowrite32(MYNET_RING_USABLE, priv->bar0 + MYNET_REG_RX_TAIL);
+
+    iowrite32(lower_32_bits(tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_LO);
+    iowrite32(upper_32_bits(tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_HI);
+    iowrite32(MYNET_RING_SIZE, priv->bar0 + MYNET_REG_TX_RING_LEN);
+
+    /* Fill TX descriptor 0 with a known pattern, distinct from the DMA
+     * self-test's pattern so a stale/leftover comparison can't pass by
+     * accident. */
+    for (i = 0; i < MYNET_TEST_PKT_LEN; i++) {
+        ((u8 *)tx_bufs)[i] = (u8)(0xA0 + (i & 0x0f));
+    }
+    tx_ring[0].addr = tx_bufs_dma;
+    tx_ring[0].len = MYNET_TEST_PKT_LEN;
+    tx_ring[0].flags = 0;
+
+    reinit_completion(&priv->irq_event);
+    iowrite32(1, priv->bar0 + MYNET_REG_TX_TAIL); /* kick: 1 descriptor posted */
+
+    timeout = wait_for_completion_timeout(&priv->irq_event,
+                                           msecs_to_jiffies(1000));
+    if (!timeout) {
+        dev_err(&pdev->dev, "mynet: ring test timed out waiting for IRQ\n");
+        goto out_free;
+    }
+
+    if (!(tx_ring[0].flags & MYNET_DESC_F_DD)) {
+        dev_err(&pdev->dev, "mynet: TX descriptor 0 not marked done\n");
+        goto out_free;
+    }
+
+    if (!(rx_ring[0].flags & MYNET_DESC_F_DD)) {
+        dev_err(&pdev->dev, "mynet: RX descriptor 0 not marked done "
+                "(packet never arrived)\n");
+        goto out_free;
+    }
+
+    if (rx_ring[0].len != MYNET_TEST_PKT_LEN) {
+        dev_err(&pdev->dev,
+                "mynet: ring test length mismatch: sent %u, received %u\n",
+                MYNET_TEST_PKT_LEN, rx_ring[0].len);
+        goto out_free;
+    }
+
+    if (memcmp(tx_bufs, rx_bufs, MYNET_TEST_PKT_LEN) == 0) {
+        dev_info(&pdev->dev,
+                  "mynet: ring loopback test PASSED (%d bytes verified)\n",
+                  MYNET_TEST_PKT_LEN);
+    } else {
+        dev_err(&pdev->dev,
+                "mynet: ring loopback test FAILED - buffer mismatch\n");
+    }
+
+out_free:
+    if (tx_ring) {
+        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * sizeof(*tx_ring),
+                           tx_ring, tx_ring_dma);
+    }
+    if (rx_ring) {
+        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * sizeof(*rx_ring),
+                           rx_ring, rx_ring_dma);
+    }
+    if (tx_bufs) {
+        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
+                           tx_bufs, tx_bufs_dma);
+    }
+    if (rx_bufs) {
+        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
+                           rx_bufs, rx_bufs_dma);
+    }
 }
 
 static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -226,6 +364,7 @@ static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
                   * guard for this one-shot probe-time self-test. */
 
     mynet_dma_loopback_test(pdev, priv);
+    mynet_ring_test(pdev, priv);
 
     return 0;
 
@@ -300,12 +439,13 @@ MODULE_DESCRIPTION("Minimal driver for QEMU mynet-pci custom device");
  *
  * Load and check:
  *   insmod mynet_drv.ko
- *   dmesg | tail -30
- * Expect, in order: "mynet: magic OK (0xcafef00d)", the scratch echo
- * line, the MSI-X vector -> irq mapping, "IRQ fired (count=1)" from the
- * doorbell self-test, then "IRQ fired (count=2)" and finally
- * "mynet: DMA loopback test PASSED (256 bytes verified)" from the DMA
- * self-test - confirming the device can DMA into/out of guest RAM and
- * signal completion via MSI-X, all without any descriptor ring yet.
+ *   dmesg | tail -40
+ * Expect, in order: magic OK, scratch echo, MSI-X vector -> irq mapping,
+ * "IRQ fired (count=1)" (doorbell self-test), "IRQ fired (count=2)" +
+ * "DMA loopback test PASSED" (single-buffer DMA self-test), then
+ * "IRQ fired (count=3)" + "ring loopback test PASSED (64 bytes
+ * verified)" - confirming a full TX descriptor -> device DMA read ->
+ * device DMA write -> RX descriptor round trip, entirely via ring
+ * bookkeeping rather than one-shot registers.
  * ---------------------------------------------------------------------
  */
