@@ -1,12 +1,27 @@
 /*
- * mynet_drv.c - Minimal Linux driver for the QEMU "mynet-pci" device
+ * mynet_drv.c - Linux net_device driver for the QEMU "mynet-pci" device
  *
- * Goal of this step: bind to the device, map BAR0, prove MMIO read/write
- * works via the magic ID and scratch registers, allocate an MSI-X vector
- * and confirm the interrupt path via a self-test doorbell write, run a
- * single-buffer loopback DMA self-test, and now a full TX/RX descriptor
- * ring self-test: post RX buffers, transmit one packet, and confirm it
- * comes back via the RX ring with matching contents.
+ * This step replaces the earlier probe-time self-tests with a real
+ * network interface: alloc_etherdev(), ndo_start_xmit for TX, and NAPI
+ * for RX. The device/ring/MSI-X mechanics are unchanged from the last
+ * step - what's new is that a normal skb from the network stack now
+ * drives the TX ring instead of a hardcoded test buffer, and incoming
+ * packets from the real -netdev backend get delivered up the stack via
+ * NAPI instead of being checked against a known pattern.
+ *
+ * Known simplifications, called out here rather than silently:
+ *   - No MAC-read register on the device, so the driver can't learn the
+ *     MAC QEMU assigned via -device mynet-pci,mac=... . It generates its
+ *     own random one instead (eth_hw_addr_random). This means "ip link"
+ *     in the guest and "info network" in the QEMU monitor will show
+ *     different MACs for the same interface - harmless for basic
+ *     connectivity, but worth knowing. Adding a MAC register + reading
+ *     it here is natural follow-up work.
+ *   - No interrupt mask/unmask register. Real hardware masks its
+ *     interrupt source until NAPI re-enables it, to avoid re-triggering
+ *     while poll is still running. This device relies on MSI-X being
+ *     edge-triggered (each event is a distinct message) plus the NAPI
+ *     framework's own scheduling guard, rather than an explicit mask.
  *
  * Build as an out-of-tree module (Makefile below) against the exact
  * kernel you're booting in the guest.
@@ -17,9 +32,11 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
-#include <linux/completion.h>
 #include <linux/dma-mapping.h>
-#include <linux/delay.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/skbuff.h>
+#include <linux/if_ether.h>
 
 #define MYNET_VENDOR_ID   0x1234
 #define MYNET_DEVICE_ID   0xBEEF
@@ -34,9 +51,6 @@
 #define MYNET_REG_DMA_LEN      0x20
 #define MYNET_REG_DMA_START    0x24
 #define MYNET_REG_DMA_STATUS   0x28
-
-#define MYNET_DMA_STATUS_OK    0
-#define MYNET_DMA_STATUS_ERROR 1
 
 #define MYNET_REG_TX_RING_LO   0x30
 #define MYNET_REG_TX_RING_HI   0x34
@@ -58,223 +72,350 @@ struct mynet_desc {
 };
 
 /* Ring size and the "reserve one slot" rule: we only ever post
- * MYNET_RING_SIZE - 1 descriptors as available at a time, even though
- * the ring itself has MYNET_RING_SIZE slots. This avoids the classic
+ * MYNET_RING_USABLE descriptors as available at a time, even though the
+ * ring itself has MYNET_RING_SIZE slots. This avoids the classic
  * head==tail ambiguity between "ring empty" and "ring completely full"
- * in a circular buffer - see the matching comment in mynet.c. */
+ * in a circular buffer - see the matching comment in mynet.c. Applies
+ * to both TX and RX rings here. */
 #define MYNET_RING_SIZE     8
 #define MYNET_RING_USABLE   (MYNET_RING_SIZE - 1)
-#define MYNET_BUF_SIZE      256
-#define MYNET_TEST_PKT_LEN  64
+
+/* One full standard Ethernet frame (1518 bytes) plus a little slack;
+ * matches the device's MYNET_MAX_PKT_LEN=2048 ceiling with room to
+ * spare, and is a conventional RX buffer size for exactly this reason. */
+#define MYNET_RX_BUF_SIZE   1536
 
 #define MYNET_MAGIC        0xCAFEF00DUL
 #define MYNET_NUM_VECTORS  1
-#define MYNET_DMA_TEST_LEN 256
 
 struct mynet_priv {
     struct pci_dev *pdev;
+    struct net_device *netdev;
     void __iomem *bar0;
     int irq;
-    unsigned int irq_count;
-    struct completion irq_event;
+
+    struct napi_struct napi;
+
+    /* TX ring - descriptors filled on demand in ndo_start_xmit,
+     * reclaimed (unmapped + skb freed) once the device sets DD. */
+    struct mynet_desc *tx_ring;
+    dma_addr_t tx_ring_dma;
+    struct sk_buff *tx_skb[MYNET_RING_SIZE];
+    dma_addr_t tx_dma[MYNET_RING_SIZE];
+    u32 tx_head; /* next descriptor to reclaim (consumer) */
+    u32 tx_tail; /* next free descriptor to fill (producer); mirrors HW TX_TAIL */
+
+    /* RX ring - all MYNET_RING_USABLE slots kept pre-posted at all
+     * times; each completed descriptor is immediately refilled with a
+     * fresh buffer before the received skb goes up the stack. */
+    struct mynet_desc *rx_ring;
+    dma_addr_t rx_ring_dma;
+    struct sk_buff *rx_skb[MYNET_RING_SIZE];
+    dma_addr_t rx_dma[MYNET_RING_SIZE];
+    u32 rx_next; /* next descriptor to check for a completed packet */
+    u32 rx_tail; /* boundary of buffers posted as available; mirrors HW RX_TAIL */
 };
+
+/* --- RX buffer (re)posting ---
+ * Allocates a fresh skb, maps it for DMA, and fills descriptor `idx`
+ * with its address/capacity. Used both for initial posting in
+ * mynet_open() and for refilling a slot in the NAPI poll after a packet
+ * is received out of it. */
+static int mynet_alloc_rx_buffer(struct mynet_priv *priv, u32 idx)
+{
+    struct sk_buff *skb;
+    dma_addr_t dma;
+
+    skb = netdev_alloc_skb(priv->netdev, MYNET_RX_BUF_SIZE);
+    if (!skb) {
+        return -ENOMEM;
+    }
+
+    /* Align the IP header (which follows a 14-byte Ethernet header) to
+     * a 4-byte boundary - standard practice, costs at most 2 bytes of
+     * tailroom. */
+    skb_reserve(skb, NET_IP_ALIGN);
+
+    dma = dma_map_single(&priv->pdev->dev, skb->data, skb_tailroom(skb),
+                          DMA_FROM_DEVICE);
+    if (dma_mapping_error(&priv->pdev->dev, dma)) {
+        dev_kfree_skb(skb);
+        return -ENOMEM;
+    }
+
+    priv->rx_skb[idx] = skb;
+    priv->rx_dma[idx] = dma;
+    priv->rx_ring[idx].addr = dma;
+    priv->rx_ring[idx].len = skb_tailroom(skb);
+    priv->rx_ring[idx].flags = 0;
+
+    return 0;
+}
+
+static void mynet_free_rx_buffer(struct mynet_priv *priv, u32 idx)
+{
+    if (!priv->rx_skb[idx]) {
+        return;
+    }
+    /* Every skb still sitting in rx_skb[] is guaranteed untouched by
+     * skb_put() - poll() always replaces a slot's skb before handing
+     * the received one up the stack - so tailroom here matches exactly
+     * what was passed to dma_map_single() when this buffer was posted. */
+    dma_unmap_single(&priv->pdev->dev, priv->rx_dma[idx],
+                      skb_tailroom(priv->rx_skb[idx]), DMA_FROM_DEVICE);
+    dev_kfree_skb(priv->rx_skb[idx]);
+    priv->rx_skb[idx] = NULL;
+}
+
+/* --- NAPI poll: reclaim TX completions, then deliver RX completions --- */
+static int mynet_poll(struct napi_struct *napi, int budget)
+{
+    struct mynet_priv *priv = container_of(napi, struct mynet_priv, napi);
+    int work_done = 0;
+    bool rx_tail_dirty = false;
+
+    /* --- TX completions --- */
+    while (priv->tx_head != priv->tx_tail) {
+        struct sk_buff *skb;
+
+        if (!(priv->tx_ring[priv->tx_head].flags & MYNET_DESC_F_DD)) {
+            break; /* device hasn't finished this one yet */
+        }
+
+        skb = priv->tx_skb[priv->tx_head];
+        dma_unmap_single(&priv->pdev->dev, priv->tx_dma[priv->tx_head],
+                          skb->len, DMA_TO_DEVICE);
+        priv->netdev->stats.tx_packets++;
+        priv->netdev->stats.tx_bytes += skb->len;
+        dev_consume_skb_any(skb);
+        priv->tx_skb[priv->tx_head] = NULL;
+        priv->tx_ring[priv->tx_head].flags = 0;
+
+        priv->tx_head = (priv->tx_head + 1) % MYNET_RING_SIZE;
+    }
+
+    if (netif_queue_stopped(priv->netdev) &&
+        (((priv->tx_tail + 1) % MYNET_RING_SIZE) != priv->tx_head)) {
+        netif_wake_queue(priv->netdev);
+    }
+
+    /* --- RX completions --- */
+    while (work_done < budget) {
+        struct mynet_desc *desc = &priv->rx_ring[priv->rx_next];
+        struct sk_buff *old_skb;
+        dma_addr_t old_dma;
+        unsigned int old_cap;
+        u32 len;
+
+        if (!(desc->flags & MYNET_DESC_F_DD)) {
+            break; /* nothing new */
+        }
+
+        old_skb = priv->rx_skb[priv->rx_next];
+        old_dma = priv->rx_dma[priv->rx_next];
+        old_cap = skb_tailroom(old_skb);
+        len = desc->len;
+
+        dma_unmap_single(&priv->pdev->dev, old_dma, old_cap, DMA_FROM_DEVICE);
+
+        if (mynet_alloc_rx_buffer(priv, priv->rx_next) != 0) {
+            /* No replacement buffer available - re-map the same skb
+             * back in place and drop this packet's contents, rather
+             * than leaving the slot without a valid mapping. */
+            dma_addr_t remap = dma_map_single(&priv->pdev->dev,
+                                               old_skb->data, old_cap,
+                                               DMA_FROM_DEVICE);
+            priv->netdev->stats.rx_dropped++;
+            priv->rx_skb[priv->rx_next] = old_skb;
+            priv->rx_dma[priv->rx_next] = remap;
+            priv->rx_ring[priv->rx_next].addr = remap;
+            priv->rx_ring[priv->rx_next].len = old_cap;
+            priv->rx_ring[priv->rx_next].flags = 0;
+        } else {
+            skb_put(old_skb, len);
+            old_skb->protocol = eth_type_trans(old_skb, priv->netdev);
+            priv->netdev->stats.rx_packets++;
+            priv->netdev->stats.rx_bytes += len;
+            napi_gro_receive(&priv->napi, old_skb);
+            work_done++;
+        }
+
+        priv->rx_next = (priv->rx_next + 1) % MYNET_RING_SIZE;
+        priv->rx_tail = (priv->rx_tail + 1) % MYNET_RING_SIZE;
+        rx_tail_dirty = true;
+    }
+
+    if (rx_tail_dirty) {
+        iowrite32(priv->rx_tail, priv->bar0 + MYNET_REG_RX_TAIL);
+    }
+
+    if (work_done < budget) {
+        napi_complete_done(napi, work_done);
+    }
+
+    return work_done;
+}
 
 static irqreturn_t mynet_irq_handler(int irq, void *data)
 {
     struct mynet_priv *priv = data;
 
-    priv->irq_count++;
-    dev_info(&priv->pdev->dev, "mynet: IRQ fired (count=%u)\n",
-              priv->irq_count);
-    complete(&priv->irq_event);
+    napi_schedule(&priv->napi);
 
     return IRQ_HANDLED;
 }
 
-/* Run once at probe time: allocate two coherent buffers, fill the source
- * with a known pattern, hand the device both bus addresses via MMIO,
- * kick DMA_START, wait for the completion IRQ, then verify the bytes
- * actually moved. Pure self-test - doesn't persist any state. */
-static void mynet_dma_loopback_test(struct pci_dev *pdev, struct mynet_priv *priv)
+static int mynet_open(struct net_device *netdev)
 {
-    void *src, *dst;
-    dma_addr_t src_dma, dst_dma;
-    unsigned long timeout;
-    u32 status;
-    int i;
+    struct mynet_priv *priv = netdev_priv(netdev);
+    int i, err;
 
-    src = dma_alloc_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, &src_dma,
-                              GFP_KERNEL);
-    if (!src) {
-        dev_err(&pdev->dev, "mynet: dma_alloc_coherent(src) failed\n");
-        return;
+    priv->tx_ring = dma_alloc_coherent(&priv->pdev->dev,
+                                        MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                                        &priv->tx_ring_dma, GFP_KERNEL);
+    priv->rx_ring = dma_alloc_coherent(&priv->pdev->dev,
+                                        MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                                        &priv->rx_ring_dma, GFP_KERNEL);
+    if (!priv->tx_ring || !priv->rx_ring) {
+        dev_err(&priv->pdev->dev, "mynet: ring allocation failed\n");
+        err = -ENOMEM;
+        goto err_free_rings;
     }
 
-    dst = dma_alloc_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, &dst_dma,
-                              GFP_KERNEL);
-    if (!dst) {
-        dev_err(&pdev->dev, "mynet: dma_alloc_coherent(dst) failed\n");
-        dma_free_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, src, src_dma);
-        return;
-    }
+    memset(priv->tx_skb, 0, sizeof(priv->tx_skb));
+    priv->tx_head = 0;
+    priv->tx_tail = 0;
 
-    /* Known pattern in src, dst left zeroed by dma_alloc_coherent. */
-    for (i = 0; i < MYNET_DMA_TEST_LEN; i++) {
-        ((u8 *)src)[i] = (u8)i;
-    }
-
-    reinit_completion(&priv->irq_event);
-
-    iowrite32(lower_32_bits(src_dma), priv->bar0 + MYNET_REG_DMA_SRC_LO);
-    iowrite32(upper_32_bits(src_dma), priv->bar0 + MYNET_REG_DMA_SRC_HI);
-    iowrite32(lower_32_bits(dst_dma), priv->bar0 + MYNET_REG_DMA_DST_LO);
-    iowrite32(upper_32_bits(dst_dma), priv->bar0 + MYNET_REG_DMA_DST_HI);
-    iowrite32(MYNET_DMA_TEST_LEN, priv->bar0 + MYNET_REG_DMA_LEN);
-    iowrite32(1, priv->bar0 + MYNET_REG_DMA_START); /* kick */
-
-    timeout = wait_for_completion_timeout(&priv->irq_event,
-                                           msecs_to_jiffies(1000));
-    if (!timeout) {
-        dev_err(&pdev->dev, "mynet: DMA test timed out waiting for IRQ\n");
-        goto out_free;
-    }
-
-    status = ioread32(priv->bar0 + MYNET_REG_DMA_STATUS);
-    if (status != MYNET_DMA_STATUS_OK) {
-        dev_err(&pdev->dev, "mynet: DMA test device status = %u (error)\n",
-                status);
-        goto out_free;
-    }
-
-    if (memcmp(src, dst, MYNET_DMA_TEST_LEN) == 0) {
-        dev_info(&pdev->dev,
-                  "mynet: DMA loopback test PASSED (%d bytes verified)\n",
-                  MYNET_DMA_TEST_LEN);
-    } else {
-        dev_err(&pdev->dev,
-                "mynet: DMA loopback test FAILED - buffer mismatch\n");
-    }
-
-out_free:
-    dma_free_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, src, src_dma);
-    dma_free_coherent(&pdev->dev, MYNET_DMA_TEST_LEN, dst, dst_dma);
-}
-
-/* Run once at probe time: set up a full TX ring and RX ring, pre-post
- * RX buffers, transmit one test packet, and confirm it comes back via
- * the RX ring with matching contents (the device loops TX -> RX
- * internally until we wire up a real -netdev backend). */
-static void mynet_ring_test(struct pci_dev *pdev, struct mynet_priv *priv)
-{
-    struct mynet_desc *tx_ring, *rx_ring;
-    dma_addr_t tx_ring_dma, rx_ring_dma;
-    void *tx_bufs, *rx_bufs;
-    dma_addr_t tx_bufs_dma, rx_bufs_dma;
-    unsigned long timeout;
-    int i;
-
-    tx_ring = dma_alloc_coherent(&pdev->dev,
-                                  MYNET_RING_SIZE * sizeof(*tx_ring),
-                                  &tx_ring_dma, GFP_KERNEL);
-    rx_ring = dma_alloc_coherent(&pdev->dev,
-                                  MYNET_RING_SIZE * sizeof(*rx_ring),
-                                  &rx_ring_dma, GFP_KERNEL);
-    tx_bufs = dma_alloc_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
-                                  &tx_bufs_dma, GFP_KERNEL);
-    rx_bufs = dma_alloc_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
-                                  &rx_bufs_dma, GFP_KERNEL);
-    if (!tx_ring || !rx_ring || !tx_bufs || !rx_bufs) {
-        dev_err(&pdev->dev, "mynet: ring test allocation failed\n");
-        goto out_free;
-    }
-
-    /* Pre-post MYNET_RING_USABLE RX descriptors, each pointing at its
-     * own slice of rx_bufs, offering MYNET_BUF_SIZE bytes of capacity. */
     for (i = 0; i < MYNET_RING_USABLE; i++) {
-        rx_ring[i].addr = rx_bufs_dma + (i * MYNET_BUF_SIZE);
-        rx_ring[i].len = MYNET_BUF_SIZE;
-        rx_ring[i].flags = 0;
+        err = mynet_alloc_rx_buffer(priv, i);
+        if (err) {
+            dev_err(&priv->pdev->dev, "mynet: RX buffer alloc failed at %d\n", i);
+            goto err_free_rx_bufs;
+        }
     }
+    priv->rx_next = 0;
+    priv->rx_tail = MYNET_RING_USABLE;
 
-    iowrite32(lower_32_bits(rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_LO);
-    iowrite32(upper_32_bits(rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_HI);
-    iowrite32(MYNET_RING_SIZE, priv->bar0 + MYNET_REG_RX_RING_LEN);
-    iowrite32(MYNET_RING_USABLE, priv->bar0 + MYNET_REG_RX_TAIL);
-
-    iowrite32(lower_32_bits(tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_LO);
-    iowrite32(upper_32_bits(tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_HI);
+    iowrite32(lower_32_bits(priv->tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_LO);
+    iowrite32(upper_32_bits(priv->tx_ring_dma), priv->bar0 + MYNET_REG_TX_RING_HI);
     iowrite32(MYNET_RING_SIZE, priv->bar0 + MYNET_REG_TX_RING_LEN);
 
-    /* Fill TX descriptor 0 with a known pattern, distinct from the DMA
-     * self-test's pattern so a stale/leftover comparison can't pass by
-     * accident. */
-    for (i = 0; i < MYNET_TEST_PKT_LEN; i++) {
-        ((u8 *)tx_bufs)[i] = (u8)(0xA0 + (i & 0x0f));
-    }
-    tx_ring[0].addr = tx_bufs_dma;
-    tx_ring[0].len = MYNET_TEST_PKT_LEN;
-    tx_ring[0].flags = 0;
+    iowrite32(lower_32_bits(priv->rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_LO);
+    iowrite32(upper_32_bits(priv->rx_ring_dma), priv->bar0 + MYNET_REG_RX_RING_HI);
+    iowrite32(MYNET_RING_SIZE, priv->bar0 + MYNET_REG_RX_RING_LEN);
+    iowrite32(priv->rx_tail, priv->bar0 + MYNET_REG_RX_TAIL);
 
-    reinit_completion(&priv->irq_event);
-    iowrite32(1, priv->bar0 + MYNET_REG_TX_TAIL); /* kick: 1 descriptor posted */
+    napi_enable(&priv->napi);
+    netif_start_queue(netdev);
 
-    timeout = wait_for_completion_timeout(&priv->irq_event,
-                                           msecs_to_jiffies(1000));
-    if (!timeout) {
-        dev_err(&pdev->dev, "mynet: ring test timed out waiting for IRQ\n");
-        goto out_free;
-    }
+    dev_info(&priv->pdev->dev, "mynet: interface up\n");
+    return 0;
 
-    if (!(tx_ring[0].flags & MYNET_DESC_F_DD)) {
-        dev_err(&pdev->dev, "mynet: TX descriptor 0 not marked done\n");
-        goto out_free;
+err_free_rx_bufs:
+    for (i = i - 1; i >= 0; i--) {
+        mynet_free_rx_buffer(priv, i);
     }
-
-    if (!(rx_ring[0].flags & MYNET_DESC_F_DD)) {
-        dev_err(&pdev->dev, "mynet: RX descriptor 0 not marked done "
-                "(packet never arrived)\n");
-        goto out_free;
+err_free_rings:
+    if (priv->tx_ring) {
+        dma_free_coherent(&priv->pdev->dev,
+                           MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                           priv->tx_ring, priv->tx_ring_dma);
+        priv->tx_ring = NULL;
     }
-
-    if (rx_ring[0].len != MYNET_TEST_PKT_LEN) {
-        dev_err(&pdev->dev,
-                "mynet: ring test length mismatch: sent %u, received %u\n",
-                MYNET_TEST_PKT_LEN, rx_ring[0].len);
-        goto out_free;
+    if (priv->rx_ring) {
+        dma_free_coherent(&priv->pdev->dev,
+                           MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                           priv->rx_ring, priv->rx_ring_dma);
+        priv->rx_ring = NULL;
     }
-
-    if (memcmp(tx_bufs, rx_bufs, MYNET_TEST_PKT_LEN) == 0) {
-        dev_info(&pdev->dev,
-                  "mynet: ring loopback test PASSED (%d bytes verified)\n",
-                  MYNET_TEST_PKT_LEN);
-    } else {
-        dev_err(&pdev->dev,
-                "mynet: ring loopback test FAILED - buffer mismatch\n");
-    }
-
-out_free:
-    if (tx_ring) {
-        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * sizeof(*tx_ring),
-                           tx_ring, tx_ring_dma);
-    }
-    if (rx_ring) {
-        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * sizeof(*rx_ring),
-                           rx_ring, rx_ring_dma);
-    }
-    if (tx_bufs) {
-        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
-                           tx_bufs, tx_bufs_dma);
-    }
-    if (rx_bufs) {
-        dma_free_coherent(&pdev->dev, MYNET_RING_SIZE * MYNET_BUF_SIZE,
-                           rx_bufs, rx_bufs_dma);
-    }
+    return err;
 }
+
+static int mynet_close(struct net_device *netdev)
+{
+    struct mynet_priv *priv = netdev_priv(netdev);
+    int i;
+
+    netif_stop_queue(netdev);
+    napi_disable(&priv->napi);
+
+    /* Free any TX skbs still in flight (posted but not yet reclaimed). */
+    for (i = 0; i < MYNET_RING_SIZE; i++) {
+        if (priv->tx_skb[i]) {
+            dma_unmap_single(&priv->pdev->dev, priv->tx_dma[i],
+                              priv->tx_skb[i]->len, DMA_TO_DEVICE);
+            dev_kfree_skb(priv->tx_skb[i]);
+            priv->tx_skb[i] = NULL;
+        }
+    }
+
+    for (i = 0; i < MYNET_RING_SIZE; i++) {
+        mynet_free_rx_buffer(priv, i);
+    }
+
+    dma_free_coherent(&priv->pdev->dev,
+                       MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                       priv->tx_ring, priv->tx_ring_dma);
+    dma_free_coherent(&priv->pdev->dev,
+                       MYNET_RING_SIZE * sizeof(struct mynet_desc),
+                       priv->rx_ring, priv->rx_ring_dma);
+    priv->tx_ring = NULL;
+    priv->rx_ring = NULL;
+
+    dev_info(&priv->pdev->dev, "mynet: interface down\n");
+    return 0;
+}
+
+static netdev_tx_t mynet_start_xmit(struct sk_buff *skb, struct net_device *netdev)
+{
+    struct mynet_priv *priv = netdev_priv(netdev);
+    dma_addr_t dma;
+    u32 tail = priv->tx_tail;
+    u32 next_tail = (tail + 1) % MYNET_RING_SIZE;
+
+    if (next_tail == priv->tx_head) {
+        /* Shouldn't normally get here - we stop the queue preemptively
+         * below once the ring is full - but guard against it anyway. */
+        netif_stop_queue(netdev);
+        return NETDEV_TX_BUSY;
+    }
+
+    dma = dma_map_single(&priv->pdev->dev, skb->data, skb->len, DMA_TO_DEVICE);
+    if (dma_mapping_error(&priv->pdev->dev, dma)) {
+        dev_kfree_skb_any(skb);
+        netdev->stats.tx_dropped++;
+        return NETDEV_TX_OK;
+    }
+
+    priv->tx_skb[tail] = skb;
+    priv->tx_dma[tail] = dma;
+    priv->tx_ring[tail].addr = dma;
+    priv->tx_ring[tail].len = skb->len;
+    priv->tx_ring[tail].flags = 0;
+
+    priv->tx_tail = next_tail;
+    iowrite32(priv->tx_tail, priv->bar0 + MYNET_REG_TX_TAIL); /* doorbell */
+
+    if (((priv->tx_tail + 1) % MYNET_RING_SIZE) == priv->tx_head) {
+        netif_stop_queue(netdev); /* no room for the next packet */
+    }
+
+    return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops mynet_netdev_ops = {
+    .ndo_open           = mynet_open,
+    .ndo_stop           = mynet_close,
+    .ndo_start_xmit     = mynet_start_xmit,
+    .ndo_set_mac_address = eth_mac_addr,
+    .ndo_validate_addr  = eth_validate_addr,
+};
 
 static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+    struct net_device *netdev;
     struct mynet_priv *priv;
-    u32 magic, scratch;
+    u32 magic;
     int err;
 
     dev_info(&pdev->dev, "mynet: probing device %04x:%04x\n",
@@ -286,62 +427,46 @@ static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         return err;
     }
 
-    /* Reserve BAR0 so no other driver can claim it while we hold it. */
     err = pci_request_region(pdev, 0, "mynet");
     if (err) {
         dev_err(&pdev->dev, "mynet: pci_request_region failed: %d\n", err);
         goto err_disable;
     }
 
-    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
-    if (!priv) {
+    netdev = alloc_etherdev(sizeof(struct mynet_priv));
+    if (!netdev) {
         err = -ENOMEM;
         goto err_release;
     }
-    priv->pdev = pdev;
-    init_completion(&priv->irq_event);
+    SET_NETDEV_DEV(netdev, &pdev->dev);
 
-    /* Map BAR0 into kernel virtual address space. */
+    priv = netdev_priv(netdev);
+    priv->pdev = pdev;
+    priv->netdev = netdev;
+
     priv->bar0 = pci_iomap(pdev, 0, 0);
     if (!priv->bar0) {
         dev_err(&pdev->dev, "mynet: pci_iomap failed\n");
         err = -ENOMEM;
-        goto err_release;
+        goto err_free_netdev;
     }
 
-    pci_set_drvdata(pdev, priv);
-    pci_set_master(pdev); /* required before any DMA - our device checks
-                            * the Bus Master Enable bit before honoring
-                            * DMA_START. */
+    pci_set_master(pdev);
 
     err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
     if (err) {
-        dev_err(&pdev->dev, "mynet: dma_set_mask_and_coherent failed: %d\n",
-                err);
+        dev_err(&pdev->dev, "mynet: dma_set_mask_and_coherent failed: %d\n", err);
         goto err_unmap;
     }
 
-    /* Sanity-check: read the magic ID register. */
     magic = ioread32(priv->bar0 + MYNET_REG_ID);
     if (magic != MYNET_MAGIC) {
-        dev_err(&pdev->dev,
-                "mynet: unexpected magic 0x%08x (want 0x%08lx)\n",
+        dev_err(&pdev->dev, "mynet: unexpected magic 0x%08x (want 0x%08lx)\n",
                 magic, MYNET_MAGIC);
         err = -ENODEV;
         goto err_unmap;
     }
-    dev_info(&pdev->dev, "mynet: magic OK (0x%08x)\n", magic);
 
-    /* Exercise the scratch register: write, read back, confirm echo. */
-    iowrite32(0xdeadbeef, priv->bar0 + MYNET_REG_SCRATCH);
-    scratch = ioread32(priv->bar0 + MYNET_REG_SCRATCH);
-    dev_info(&pdev->dev, "mynet: scratch wrote 0xdeadbeef, read back 0x%08x\n",
-              scratch);
-
-    /* Allocate one MSI-X vector. PCI_IRQ_MSIX only (no fallback to
-     * MSI/INTx) since the device only implements MSI-X. */
-    err = pci_msix_vec_count(pdev);
-    dev_info(&pdev->dev, "mynet: pci_msix_vec_count() = %d\n", err);
     err = pci_alloc_irq_vectors(pdev, MYNET_NUM_VECTORS, MYNET_NUM_VECTORS,
                                  PCI_IRQ_MSIX);
     if (err < 0) {
@@ -349,29 +474,43 @@ static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_unmap;
     }
 
+    netdev->netdev_ops = &mynet_netdev_ops;
+    netif_napi_add(netdev, &priv->napi, mynet_poll);
+
     priv->irq = pci_irq_vector(pdev, 0);
     err = request_irq(priv->irq, mynet_irq_handler, 0, "mynet", priv);
     if (err) {
         dev_err(&pdev->dev, "mynet: request_irq failed: %d\n", err);
-        goto err_free_vectors;
+        goto err_napi_del;
     }
     dev_info(&pdev->dev, "mynet: MSI-X vector 0 -> irq %d\n", priv->irq);
 
-    /* Self-test: ring the doorbell once and confirm the handler fires. */
-    iowrite32(1, priv->bar0 + MYNET_REG_IRQ_TRIGGER);
-    msleep(50); /* let the doorbell IRQ above land before we reinit the
-                  * completion for the DMA test below - simple ordering
-                  * guard for this one-shot probe-time self-test. */
+    /* No MAC-read register on this device yet - see the note at the top
+     * of this file. Generates a random locally-administered MAC. */
+    eth_hw_addr_random(netdev);
 
-    mynet_dma_loopback_test(pdev, priv);
-    mynet_ring_test(pdev, priv);
+    pci_set_drvdata(pdev, netdev);
+
+    err = register_netdev(netdev);
+    if (err) {
+        dev_err(&pdev->dev, "mynet: register_netdev failed: %d\n", err);
+        goto err_free_irq;
+    }
+
+    dev_info(&pdev->dev, "mynet: registered as %s, MAC %pM\n",
+              netdev->name, netdev->dev_addr);
 
     return 0;
 
-err_free_vectors:
+err_free_irq:
+    free_irq(priv->irq, priv);
+err_napi_del:
+    netif_napi_del(&priv->napi);
     pci_free_irq_vectors(pdev);
 err_unmap:
     pci_iounmap(pdev, priv->bar0);
+err_free_netdev:
+    free_netdev(netdev);
 err_release:
     pci_release_region(pdev, 0);
 err_disable:
@@ -381,16 +520,19 @@ err_disable:
 
 static void mynet_remove(struct pci_dev *pdev)
 {
-    struct mynet_priv *priv = pci_get_drvdata(pdev);
+    struct net_device *netdev = pci_get_drvdata(pdev);
+    struct mynet_priv *priv = netdev_priv(netdev);
 
-    dev_info(&pdev->dev, "mynet: removing device (total irqs: %u)\n",
-              priv->irq_count);
+    dev_info(&pdev->dev, "mynet: removing device\n");
 
+    unregister_netdev(netdev); /* calls ndo_stop if the interface was up */
+    netif_napi_del(&priv->napi);
     free_irq(priv->irq, priv);
     pci_free_irq_vectors(pdev);
     pci_iounmap(pdev, priv->bar0);
     pci_release_region(pdev, 0);
     pci_disable_device(pdev);
+    free_netdev(netdev);
 }
 
 static const struct pci_device_id mynet_ids[] = {
@@ -409,7 +551,7 @@ static struct pci_driver mynet_driver = {
 module_pci_driver(mynet_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Minimal driver for QEMU mynet-pci custom device");
+MODULE_DESCRIPTION("Linux net_device driver for QEMU mynet-pci custom device");
 
 /*
  * ---------------------------------------------------------------------
@@ -437,15 +579,18 @@ MODULE_DESCRIPTION("Minimal driver for QEMU mynet-pci custom device");
  *            -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare
  *     guest: mount -t 9p -o trans=virtio hostshare /mnt
  *
- * Load and check:
+ * Load and bring the interface up:
  *   insmod mynet_drv.ko
- *   dmesg | tail -40
- * Expect, in order: magic OK, scratch echo, MSI-X vector -> irq mapping,
- * "IRQ fired (count=1)" (doorbell self-test), "IRQ fired (count=2)" +
- * "DMA loopback test PASSED" (single-buffer DMA self-test), then
- * "IRQ fired (count=3)" + "ring loopback test PASSED (64 bytes
- * verified)" - confirming a full TX descriptor -> device DMA read ->
- * device DMA write -> RX descriptor round trip, entirely via ring
- * bookkeeping rather than one-shot registers.
+ *   dmesg | tail -10
+ *   ip link set eth0 up
+ *   ip addr add 10.0.2.15/24 dev eth0     # matches SLIRP's default subnet
+ *   ip route add default via 10.0.2.2 dev eth0
+ *
+ * Test connectivity:
+ *   ping 10.0.2.2                          # SLIRP's built-in gateway
+ *   ping 10.0.2.3                          # SLIRP's built-in DNS stub
+ * On the host, capture with a filter-dump object (see mynet.c's build
+ * comment) or tcpdump on a tap interface if using -netdev tap instead
+ * of -netdev user, to watch real ARP/ICMP traffic cross the wire.
  * ---------------------------------------------------------------------
  */
