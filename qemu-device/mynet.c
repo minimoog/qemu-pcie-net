@@ -3,8 +3,12 @@
  *
  * Implements so far: PCI/PCIe enumeration, one MMIO register BAR (BAR0),
  * an MSI-X interrupt (BAR1, one vector), a synchronous loopback DMA
- * test, and now TX/RX descriptor rings (also looped back internally -
- * no real host network backend yet).
+ * test, TX/RX descriptor rings, and now a real NetClientState hookup -
+ * transmitted packets go out through whatever -netdev backend the user
+ * configured (tap/user/socket/...), and packets arriving from that
+ * backend are delivered into the RX ring via the .receive callback.
+ * TX and RX are now properly decoupled/asynchronous, unlike the earlier
+ * internal-loopback stand-in.
  *
  * Drop this file into: hw/net/mynet.c  (inside the QEMU source tree)
  * Build wiring shown at the bottom of this file's comments.
@@ -15,7 +19,9 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "hw/core/qdev-properties.h"
 #include "system/dma.h"
+#include "net/net.h"
 #include "qom/object.h"
 
 #define TYPE_MYNET_PCI "mynet-pci"
@@ -120,6 +126,9 @@ struct MyNetState {
 
     uint32_t tx_ring_lo, tx_ring_hi, tx_ring_len, tx_head, tx_tail;
     uint32_t rx_ring_lo, rx_ring_hi, rx_ring_len, rx_head, rx_tail;
+
+    NICState *nic;
+    NICConf conf;
 };
 
 /* --- Loopback DMA implementation --- */
@@ -231,11 +240,12 @@ static bool mynet_rx_deliver(MyNetState *s, const uint8_t *pkt, uint32_t pkt_len
 }
 
 /* Process every TX descriptor between our current tx_head and the new
- * tail the guest just doorbelled. For each: DMA-read the packet payload,
- * hand it to mynet_rx_deliver() (our stand-in for "send it out the
- * wire, and here it is coming back in"), then mark the TX descriptor
- * done so the guest can reclaim/reuse that buffer. Fires one IRQ after
- * the whole batch, not per-descriptor. */
+ * tail the guest just doorbelled. For each: DMA-read the packet payload
+ * and hand it to the -netdev backend via qemu_send_packet(), then mark
+ * the TX descriptor done so the guest can reclaim/reuse that buffer.
+ * Fires one IRQ after the whole batch, not per-descriptor. Note this
+ * has nothing to do with RX anymore - see mynet_net_receive() below for
+ * how packets now arrive. */
 static void mynet_process_tx(MyNetState *s)
 {
     dma_addr_t tx_base;
@@ -268,10 +278,12 @@ static void mynet_process_tx(MyNetState *s)
                    != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR, "mynet: TX buffer DMA read failed\n");
         } else {
-            /* Loopback stand-in for "transmit it" - real hardware sends
-             * it out the wire here; a real -netdev backend hookup is
-             * the next step after this one. */
-            mynet_rx_deliver(s, pkt, desc.len);
+            /* Hand it to the configured -netdev backend (tap/user/
+             * socket/...) - this is a real transmit now, not a
+             * loopback stand-in. Whatever comes back in response (if
+             * anything) arrives later, asynchronously, via
+             * mynet_net_receive() below - NOT synchronously from here. */
+            qemu_send_packet(qemu_get_queue(s->nic), pkt, desc.len);
         }
 
         /* Mark done regardless of outcome above, so the guest can always
@@ -288,6 +300,46 @@ static void mynet_process_tx(MyNetState *s)
         msix_notify(&s->parent_obj, 0);
     }
 }
+
+/* --- NetClientState hookup ---
+ * Called by QEMU's networking core whenever the configured -netdev
+ * backend has a packet for us (e.g. a real host-side packet arrived on
+ * a tap device, or SLIRP is replying to something we sent). Runs
+ * asynchronously, independent of anything happening on the TX side. */
+static ssize_t mynet_net_receive(NetClientState *nc, const uint8_t *buf,
+                                  size_t size)
+{
+    MyNetState *s = qemu_get_nic_opaque(nc);
+
+    if (size > MYNET_MAX_PKT_LEN) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "mynet: incoming packet too large (%zu), dropping\n",
+                      size);
+        return size; /* consumed (dropped) - nothing else can take it either */
+    }
+
+    mynet_rx_deliver(s, buf, (uint32_t)size);
+
+    /* Fire the same IRQ path as TX completions - the guest's interrupt
+     * handler just knows "something happened, go check ring state",
+     * same single-vector model as everything else so far. */
+    if (msix_enabled(&s->parent_obj)) {
+        msix_notify(&s->parent_obj, 0);
+    }
+
+    return size;
+}
+
+/* We don't implement .can_receive (flow control) - a real driver would,
+ * so QEMU can hold off calling .receive until the guest has posted RX
+ * buffers, instead of us just dropping-and-logging when none are
+ * available (see mynet_rx_deliver above). Fine for a learning project;
+ * worth knowing as a real-hardware-driver gap. */
+static NetClientInfo net_mynet_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = mynet_net_receive,
+};
 
 /* --- MMIO read/write callbacks for BAR0 --- */
 
@@ -452,12 +504,35 @@ static void mynet_realize(PCIDevice *pdev, Error **errp)
     s->rx_ring_len = 0;
     s->rx_head = 0;
     s->rx_tail = 0;
+
+    /* Create the NIC and attach it to whatever -netdev the user pointed
+     * at us. qemu_macaddr_default_if_unset() fills in a sane MAC if the
+     * user didn't pass mac=... on the command line. object_get_typename
+     * and dev->id are what show up in QEMU's own "info network" output. */
+    qemu_macaddr_default_if_unset(&s->conf.macaddr);
+    s->nic = qemu_new_nic(&net_mynet_info, &s->conf,
+                           object_get_typename(OBJECT(pdev)),
+                           pdev->qdev.id,
+                           &pdev->qdev.mem_reentrancy_guard, s);
+
+    /* Tell the backend our MAC so things like SLIRP's built-in DHCP
+     * server can address us correctly. */
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
 }
 
 static void mynet_exit(PCIDevice *pdev)
 {
+    MyNetState *s = MYNET_PCI(pdev);
+
+    qemu_del_nic(s->nic);
     msix_uninit_exclusive_bar(pdev);
 }
+
+/* Exposes "netdev=..." and "mac=..." as -device mynet-pci properties.
+ * Without this, there's no way to attach a backend on the command line. */
+static Property mynet_properties[] = {
+    DEFINE_NIC_PROPERTIES(MyNetState, conf),
+};
 
 static void mynet_class_init(ObjectClass *klass, const void *data)
 {
@@ -473,6 +548,8 @@ static void mynet_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "Minimal custom PCI NIC skeleton";
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+    device_class_set_props_n(dc, mynet_properties,
+                              ARRAY_SIZE(mynet_properties));
 }
 
 static const TypeInfo mynet_info = {
@@ -511,14 +588,23 @@ type_init(mynet_register_types)
  * 4. Rebuild:
  *      cd build && ninja
  *
- * 5. Run with the device attached:
- *      qemu-system-x86_64 ... -device mynet-pci
+ * 5. Run with the device attached AND a backend wired to it:
+ *      qemu-system-x86_64 ... \
+ *        -netdev user,id=n0 \
+ *        -device mynet-pci,netdev=n0
+ *    (-netdev user = SLIRP, no root needed, gives NAT'd access to the
+ *    host network. -netdev tap,... is the other common choice. Without
+ *    a netdev= the device still enumerates but transmits go nowhere.)
  *
  * 6. In the guest, confirm it enumerates:
  *      lspci -v | grep -A5 1234:beef
  *    You should now see BAR0 (4KB MMIO regs) AND BAR1 (MSI-X table/PBA),
  *    plus an "MSI-X: Enable+" capability line once the guest driver turns
  *    it on.
+ *
+ * Confirm the backend attached, from the QEMU monitor:
+ *      (qemu) info network
+ *    Should show mynet-pci linked to your netdev, with its MAC.
  *
  * Test the interrupt path from the guest:
  *   - insmod the driver (it enables MSI-X + requests the IRQ in probe)
@@ -533,16 +619,17 @@ type_init(mynet_register_types)
  *   - driver's IRQ handler completes a wait_for_completion; probe then
  *     memcmp's src vs dst and logs pass/fail
  *
- * Test the descriptor ring path from the guest:
- *   - driver posts RX descriptors (buffers offered), configures both
- *     rings' base/length registers, writes RX_TAIL to mark buffers
- *     available
- *   - driver fills one TX descriptor with a test packet, writes TX_TAIL
- *   - device drains the TX ring, DMA-reads each packet, loops it into
- *     the RX ring via mynet_rx_deliver(), marks TX descriptors done,
- *     fires IRQ
- *   - driver's IRQ handler completes; probe then checks the RX
- *     descriptor's DD flag and memcmp's the received bytes against what
- *     it sent
+ * NOTE on the driver's ring self-test after this change:
+ *   The old test sent one packet and waited for it to come straight
+ *   back, which worked only because TX looped internally into RX. Now
+ *   TX goes out to the real backend and nothing comes back
+ *   synchronously, so that test WILL time out on the RX half. That's
+ *   expected, not a regression - the driver needs a real net_device
+ *   (alloc_etherdev/NAPI) before incoming traffic is meaningful, since
+ *   the guest network stack has to actually respond to ARP etc. for
+ *   anything to arrive. Verify TX alone in the meantime:
+ *     - run `tcpdump -i <tap-if>` on the host, or use -netdev
+ *       socket,listen= with a second QEMU instance, and confirm the
+ *       bytes your TX descriptor carried actually show up outside.
  * ---------------------------------------------------------------------
  */

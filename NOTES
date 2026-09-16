@@ -93,3 +93,15 @@ Symbol: PCI_MSI [=y]                                                            
 
 
   
+./qemu-system-x86_64 \
+  -M q35 \
+  -m 512M \
+  -enable-kvm \
+  -device mynet-pci,netdev=n0 \
+  -kernel ~/Developer/buildroot/output/images/bzImage \
+  -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
+  -append "root=/dev/vda console=ttyS0" \
+  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
+  -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
+  -netdev user,id=0 \
+  -nographic
