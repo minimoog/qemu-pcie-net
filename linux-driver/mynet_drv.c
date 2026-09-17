@@ -37,6 +37,7 @@
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 #include <linux/if_ether.h>
+#include <linux/spinlock.h>
 
 #define MYNET_VENDOR_ID   0x1234
 #define MYNET_DEVICE_ID   0xBEEF
@@ -95,6 +96,16 @@ struct mynet_priv {
     int irq;
 
     struct napi_struct napi;
+
+    /* Protects tx_head/tx_tail/tx_skb[]/tx_ring[] against concurrent
+     * access from ndo_start_xmit() (can run on any CPU, called by the
+     * network stack) and the TX-reclaim loop in mynet_poll() (runs in
+     * NAPI/softirq context, which can land on a different CPU than
+     * whichever one is transmitting). Without this, the two can race
+     * and produce a torn view of the ring - the RX side doesn't need
+     * this, since NAPI itself guarantees only one poll instance runs
+     * per napi_struct at a time. */
+    spinlock_t tx_lock;
 
     /* TX ring - descriptors filled on demand in ndo_start_xmit,
      * reclaimed (unmapped + skb freed) once the device sets DD. */
@@ -175,6 +186,7 @@ static int mynet_poll(struct napi_struct *napi, int budget)
     bool rx_tail_dirty = false;
 
     /* --- TX completions --- */
+    spin_lock(&priv->tx_lock);
     while (priv->tx_head != priv->tx_tail) {
         struct sk_buff *skb;
 
@@ -194,55 +206,69 @@ static int mynet_poll(struct napi_struct *napi, int budget)
         priv->tx_head = (priv->tx_head + 1) % MYNET_RING_SIZE;
     }
 
-    if (netif_queue_stopped(priv->netdev) &&
-        (((priv->tx_tail + 1) % MYNET_RING_SIZE) != priv->tx_head)) {
-        netif_wake_queue(priv->netdev);
+    /* Decide under the lock (reading tx_tail/tx_head consistently),
+     * but call netif_wake_queue() itself outside it - no need to hold
+     * our own lock while calling into the netdev core. */
+    {
+        bool need_wake = netif_queue_stopped(priv->netdev) &&
+                          (((priv->tx_tail + 1) % MYNET_RING_SIZE) != priv->tx_head);
+        spin_unlock(&priv->tx_lock);
+        if (need_wake) {
+            netif_wake_queue(priv->netdev);
+        }
     }
 
-    /* --- RX completions --- */
+    /* --- RX completions ---
+     * Consumption happens at rx_next (mirrors the device's internal
+     * head, advancing in strict delivery order). Reposting a fresh
+     * buffer happens at rx_tail (advancing in strict production order).
+     * These are NOT the same index except once every full lap - see
+     * the comment below for why that distinction matters. */
     while (work_done < budget) {
         struct mynet_desc *desc = &priv->rx_ring[priv->rx_next];
-        struct sk_buff *old_skb;
-        dma_addr_t old_dma;
-        unsigned int old_cap;
+        struct sk_buff *skb;
+        dma_addr_t dma;
+        unsigned int cap;
         u32 len;
 
         if (!(desc->flags & MYNET_DESC_F_DD)) {
             break; /* nothing new */
         }
 
-        old_skb = priv->rx_skb[priv->rx_next];
-        old_dma = priv->rx_dma[priv->rx_next];
-        old_cap = skb_tailroom(old_skb);
+        skb = priv->rx_skb[priv->rx_next];
+        dma = priv->rx_dma[priv->rx_next];
+        cap = skb_tailroom(skb);
         len = desc->len;
 
-        dma_unmap_single(&priv->pdev->dev, old_dma, old_cap, DMA_FROM_DEVICE);
+        dma_unmap_single(&priv->pdev->dev, dma, cap, DMA_FROM_DEVICE);
 
-        if (mynet_alloc_rx_buffer(priv, priv->rx_next) != 0) {
-            /* No replacement buffer available - re-map the same skb
-             * back in place and drop this packet's contents, rather
-             * than leaving the slot without a valid mapping. */
-            dma_addr_t remap = dma_map_single(&priv->pdev->dev,
-                                               old_skb->data, old_cap,
-                                               DMA_FROM_DEVICE);
-            priv->netdev->stats.rx_dropped++;
-            priv->rx_skb[priv->rx_next] = old_skb;
-            priv->rx_dma[priv->rx_next] = remap;
-            priv->rx_ring[priv->rx_next].addr = remap;
-            priv->rx_ring[priv->rx_next].len = old_cap;
-            priv->rx_ring[priv->rx_next].flags = 0;
-        } else {
-            skb_put(old_skb, len);
-            old_skb->protocol = eth_type_trans(old_skb, priv->netdev);
-            priv->netdev->stats.rx_packets++;
-            priv->netdev->stats.rx_bytes += len;
-            napi_gro_receive(&priv->napi, old_skb);
-            work_done++;
-        }
+        skb_put(skb, len);
+        skb->protocol = eth_type_trans(skb, priv->netdev);
+        priv->netdev->stats.rx_packets++;
+        priv->netdev->stats.rx_bytes += len;
+        napi_gro_receive(&priv->napi, skb);
+        work_done++;
 
         priv->rx_next = (priv->rx_next + 1) % MYNET_RING_SIZE;
-        priv->rx_tail = (priv->rx_tail + 1) % MYNET_RING_SIZE;
-        rx_tail_dirty = true;
+
+        /* Post a fresh buffer at the TAIL position - NOT at the index
+         * we just consumed. With N-1 buffers kept posted at all times,
+         * production and consumption both cycle through the same N
+         * physical slots but stay (N-1) steps apart in steady state, so
+         * the index that becomes free for a new post only coincides
+         * with the just-freed index once every full lap - not on the
+         * very next packet. Reposting at rx_next instead of rx_tail was
+         * the bug behind the NULL-pointer crash: it silently handed the
+         * device an index (the original never-posted "reserve" slot)
+         * that the driver had never actually put a valid buffer into. */
+        if (mynet_alloc_rx_buffer(priv, priv->rx_tail) == 0) {
+            priv->rx_tail = (priv->rx_tail + 1) % MYNET_RING_SIZE;
+            rx_tail_dirty = true;
+        }
+        /* On allocation failure: don't advance rx_tail this round.
+         * Available capacity shrinks by one slot until a later poll
+         * successfully reposts here - the packet just received above
+         * was still delivered fine either way. */
     }
 
     if (rx_tail_dirty) {
@@ -370,21 +396,28 @@ static netdev_tx_t mynet_start_xmit(struct sk_buff *skb, struct net_device *netd
 {
     struct mynet_priv *priv = netdev_priv(netdev);
     dma_addr_t dma;
-    u32 tail = priv->tx_tail;
-    u32 next_tail = (tail + 1) % MYNET_RING_SIZE;
+    u32 tail, next_tail;
 
-    if (next_tail == priv->tx_head) {
-        /* Shouldn't normally get here - we stop the queue preemptively
-         * below once the ring is full - but guard against it anyway. */
-        netif_stop_queue(netdev);
-        return NETDEV_TX_BUSY;
-    }
-
+    /* Map before taking the lock - this doesn't touch any shared ring
+     * state, no need to hold the lock across it. */
     dma = dma_map_single(&priv->pdev->dev, skb->data, skb->len, DMA_TO_DEVICE);
     if (dma_mapping_error(&priv->pdev->dev, dma)) {
         dev_kfree_skb_any(skb);
         netdev->stats.tx_dropped++;
         return NETDEV_TX_OK;
+    }
+
+    spin_lock(&priv->tx_lock);
+
+    tail = priv->tx_tail;
+    next_tail = (tail + 1) % MYNET_RING_SIZE;
+    if (next_tail == priv->tx_head) {
+        /* Shouldn't normally get here - we stop the queue preemptively
+         * below once the ring is full - but guard against it anyway. */
+        spin_unlock(&priv->tx_lock);
+        dma_unmap_single(&priv->pdev->dev, dma, skb->len, DMA_TO_DEVICE);
+        netif_stop_queue(netdev);
+        return NETDEV_TX_BUSY;
     }
 
     priv->tx_skb[tail] = skb;
@@ -399,6 +432,8 @@ static netdev_tx_t mynet_start_xmit(struct sk_buff *skb, struct net_device *netd
     if (((priv->tx_tail + 1) % MYNET_RING_SIZE) == priv->tx_head) {
         netif_stop_queue(netdev); /* no room for the next packet */
     }
+
+    spin_unlock(&priv->tx_lock);
 
     return NETDEV_TX_OK;
 }
@@ -443,6 +478,7 @@ static int mynet_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     priv = netdev_priv(netdev);
     priv->pdev = pdev;
     priv->netdev = netdev;
+    spin_lock_init(&priv->tx_lock);
 
     priv->bar0 = pci_iomap(pdev, 0, 0);
     if (!priv->bar0) {
