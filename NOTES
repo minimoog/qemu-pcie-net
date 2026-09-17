@@ -103,5 +103,47 @@ Symbol: PCI_MSI [=y]                                                            
   -append "root=/dev/vda console=ttyS0" \
   -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
   -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
-  -netdev user,id=0 \
+  -netdev user,id=n0 \
   -nographic
+
+
+to dump network packets
+
+./qemu-system-x86_64 \
+  -M q35 \
+  -m 512M \
+  -enable-kvm \
+  -device mynet-pci,netdev=n0 \
+  -kernel ~/Developer/buildroot/output/images/bzImage \
+  -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
+  -append "root=/dev/vda console=ttyS0" \
+  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
+  -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
+  -netdev user,id=n0 \
+  -object filter-dump,id=dump0,netdev=n0,file=/tmp/mynet.pcap \
+  -nographic
+
+
+
+sudo ip tuntap add dev tap0 mode tap user $(whoami)
+sudo ip addr add 192.168.100.1/24 dev tap0
+sudo ip link set tap0 up
+
+
+sudo iptables -t nat -A POSTROUTING -s 192.168.111.0/24 -o wlp6s0 -j MASQUERADE
+sudo iptables -A FORWARD -i tap0 -o wlp6s0 -j ACCEPT
+sudo iptables -A FORWARD -i wlp6s0  -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+
+./qemu-system-x86_64 \
+  -M q35 -m 512M -enable-kvm \
+  -device mynet-pci,netdev=n0 \
+  -netdev tap,id=n0,ifname=tap0,script,downscript \
+  -kernel ~/Developer/buildroot/output/images/bzImage \
+  -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
+  -append "root=/dev/vda console=ttyS0" \
+  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
+  -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
+  -nographic
+
+
