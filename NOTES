@@ -131,14 +131,25 @@ sudo ip link set tap0 up
 
 
 sudo iptables -t nat -A POSTROUTING -s 192.168.111.0/24 -o wlp6s0 -j MASQUERADE
-sudo iptables -A FORWARD -i tap0 -o wlp6s0 -j ACCEPT
-sudo iptables -A FORWARD -i wlp6s0  -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -i tap1 -o wlp6s0 -j ACCEPT
+sudo iptables -A FORWARD -i wlp6s0  -o tap1 -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 
 ./qemu-system-x86_64 \
   -M q35 -m 512M -enable-kvm \
   -device mynet-pci,netdev=n0 \
-  -netdev tap,id=n0,ifname=tap0,script,downscript \
+  -netdev tap,id=n0,ifname=tap1,script=no,downscript=no \
+  -kernel ~/Developer/buildroot/output/images/bzImage \
+  -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
+  -append "root=/dev/vda console=ttyS0" \
+  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
+  -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
+  -nographic
+
+./qemu-system-x86_64 \
+  -M q35 -m 512M -enable-kvm \
+  -device mynet-pci \
+  -device myscratch-pci,size=1048576 \
   -kernel ~/Developer/buildroot/output/images/bzImage \
   -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
   -append "root=/dev/vda console=ttyS0" \
@@ -147,3 +158,11 @@ sudo iptables -A FORWARD -i wlp6s0  -o tap0 -m state --state RELATED,ESTABLISHED
   -nographic
 
 
+system_ss.add(when: 'CONFIG_MYSCRATCH_PCI', if_true: files('myscratch.c')) in hw/misc/meson.build
+
+config MYSCRATCH_PCI
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    
+in hw/misc/Kconfig
