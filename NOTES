@@ -153,7 +153,7 @@ sudo iptables -A FORWARD -i wlp6s0  -o tap1 -m state --state RELATED,ESTABLISHED
   -kernel ~/Developer/buildroot/output/images/bzImage \
   -drive file=~/Developer/buildroot/output/images/rootfs.ext2,if=virtio,format=raw \
   -append "root=/dev/vda console=ttyS0" \
-  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver,security_model=none \
+  -fsdev local,id=fsdev0,path=/home/minimoog/Developer/qemu-pcie-net/linux-driver-myscratch,security_model=none \
   -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare \
   -nographic
 
@@ -164,5 +164,5 @@ config MYSCRATCH_PCI
     bool
     default y if PCI_DEVICES
     depends on PCI
-    
+
 in hw/misc/Kconfig
